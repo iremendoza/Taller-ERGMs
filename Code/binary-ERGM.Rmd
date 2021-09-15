@@ -1,0 +1,1068 @@
+---
+title: "binary-ERGM"
+author: "Blanca Arroyo-Correa"
+date: "8/8/2019"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r initialize, message= FALSE, warning=FALSE}
+
+library(sand)
+library(ergm)
+library(igraph)
+library(ggplot2)
+library(dplyr)
+library(maditr)
+library(textshape)
+library(VIF)
+library(bipartite)
+library(sjstats)
+library(Hmisc)
+library(network)
+library(nlme)
+install.packages("viridis")
+library("viridis")
+library(ergm.count)
+
+```
+ 
+ 
+# Test collinearity
+
+Here I removed all redundant predictor variables after testing for multicollinearity. First, I checked it using VIF factors and then I calculated the correlation coefficients between pairs of predictors and set the threshold to P< 0.05 and r> 0.3.
+
+```{r collinearity}
+
+rocina <- read.table("../Database/rocina_halimium_09072019.csv", sep=";", header=T)
+rocina$N_visitations <- as.numeric(rocina$N_visitations)
+rocina <- rocina[,c(5,6,8)]
+
+rocina.m <- dcast(rocina, Plant_ID ~ Pollinator_sp, value.var="N_visitations", fun.aggregate = sum)
+rocina.m$nothing <- NULL
+rocina.m$Butterfly <- NULL
+
+
+individual <- read.table("../Database/individual_data_halimium_20190714.csv", sep=";", header=T)
+
+data <- merge(rocina.m, individual, by="Plant_ID")
+
+
+vif_func<-function(in_frame,thresh=10,trace=T,...){
+	
+	require(fmsb)
+	
+	if(class(in_frame) != 'data.frame') in_frame<-data.frame(in_frame)
+	
+	#get initial vif value for all comparisons of variables
+	vif_init<-NULL
+	var_names <- names(in_frame)
+	for(val in var_names){
+		regressors <- var_names[-which(var_names == val)]
+		form <- paste(regressors, collapse = '+')
+		form_in <- formula(paste(val, '~', form))
+		vif_init<-rbind(vif_init, c(val, VIF(lm(form_in, data = in_frame, ...))))
+	}
+	vif_max<-max(as.numeric(vif_init[,2]), na.rm = TRUE)
+	
+	if(vif_max < thresh){
+		if(trace==T){ #print output of each iteration
+			prmatrix(vif_init,collab=c('var','vif'),rowlab=rep('',nrow(vif_init)),quote=F)
+			cat('\n')
+			cat(paste('All variables have VIF < ', thresh,', max VIF ',round(vif_max,2), sep=''),'\n\n')
+		}
+		return(var_names)
+	}
+	else{
+		
+		in_dat<-in_frame
+		
+		#backwards selection of explanatory variables, stops when all VIF values are below 'thresh'
+		while(vif_max >= thresh){
+			
+			vif_vals<-NULL
+			var_names <- names(in_dat)
+			
+			for(val in var_names){
+				regressors <- var_names[-which(var_names == val)]
+				form <- paste(regressors, collapse = '+')
+				form_in <- formula(paste(val, '~', form))
+				vif_add<-VIF(lm(form_in, data = in_dat, ...))
+				vif_vals<-rbind(vif_vals,c(val,vif_add))
+			}
+			max_row<-which(vif_vals[,2] == max(as.numeric(vif_vals[,2]), na.rm = TRUE))[1]
+			
+			vif_max<-as.numeric(vif_vals[max_row,2])
+			
+			if(vif_max<thresh) break
+			
+			if(trace==T){ #print output of each iteration
+				prmatrix(vif_vals,collab=c('var','vif'),rowlab=rep('',nrow(vif_vals)),quote=F)
+				cat('\n')
+				cat('removed: ',vif_vals[max_row,1],vif_max,'\n\n')
+				flush.console()
+			}
+			
+			in_dat<-in_dat[,!names(in_dat) %in% vif_vals[max_row,1]]
+			
+		}
+		
+		return(names(in_dat))
+		
+	}
+	
+}
+
+
+x <- data %>%  
+           dplyr::select(c(25:51))  # Select predictor variables
+str(x)
+
+res2 <- rcorr(as.matrix(x))
+res2$P
+which(res2$P < 0.05)
+
+res2$P[] < 0.05 & res2$r[] > 0.3 
+
+
+```
+
+# Test spatial autocorrelation of total number of visits
+
+This is further analyzed in the spatial-structure file.
+
+```{r, echo=TRUE, message=TRUE, warning=FALSE}
+
+lme1 <-lme(Total_visits ~ 1, random=~1|Plant_ID, data=data)
+summary(lme1)
+
+lme2<-update(lme1, correlation=corAR1()) # assumes that the measurements are equally spaced.
+summary(lme2)
+
+anova(lme1, lme2)
+
+#lme1.spatial <- update(lme1, correlation = corLin(1, form = ~ Latitude + Longitude), method = "ML")
+#summary(lme1.spatial)
+
+```
+
+ 
+# Set node attibutes
+
+```{r nodes, echo= TRUE, message= TRUE, warning= FALSE, fig.width= 9}
+ 
+# Add the node attributes
+# visits 2:9
+
+int <- data %>% 
+           dplyr::select(2:22) 
+           
+
+net.g<- graph_from_incidence_matrix(int, weighted= T, add.names=NULL) # using an incidence matrix (interaction data) to create an igraph object
+net.edg<- as_edgelist(net.g)  # not really necessary
+
+ 
+# Subsetting the covariates from the main dataset
+# phenotypic and microsite variation among plant individuals
+attr <- data %>%  
+           dplyr::select(c(1, 25:51)) 
+
+attr$Max_height_m <- scale(attr$Max_height_m)
+attr$Flower_guide <- scale(attr$Flower_guide)
+attr$Flower_size <- scale(attr$Flower_size)
+attr$Sum_flower_number <- scale(attr$Sum_flower_number)
+attr$Synchrony_marquis <- scale(attr$Synchrony_marquis)
+attr$Distance_to_stream <- scale(attr$Distance_to_stream)
+attr$Distance_to_tree <- scale(attr$Distance_to_tree)
+attr$Distance_to_edge <- scale(attr$Distance_to_edge)
+attr$Neighbour_intra_1m_m2 <- scale(attr$Neighbour_intra_1m_m2)
+attr$Neighbour_inter_1m_m2 <- scale(attr$Neighbour_inter_1m_m2)
+attr$Neighbour_intra_2m_m2 <- scale(attr$Neighbour_intra_2m_m2)
+attr$Neighbour_inter_2m_m2 <- scale(attr$Neighbour_inter_2m_m2)
+                 
+       
+# Create the attributes matrix
+V(net.g)$Plant_ID<-     attr$Plant_ID
+#V(net.g)$Flower_number<-  attr$Flower_number
+#V(net.g)$Pol_richness<-     attr$Pol_richness
+V(net.g)$Max_height_m<-     attr$Max_height_m
+V(net.g)$Mean_height_m<-     attr$Mean_height_m
+V(net.g)$Area_m2<-   attr$Area_m2
+V(net.g)$Perimeter_m<-   attr$Perimeter_m
+V(net.g)$Flower_guide<-   attr$Flower_guide
+V(net.g)$Flower_size<-   attr$Flower_size 
+V(net.g)$Mean_flower_number<-   attr$Mean_flower_number
+V(net.g)$Sum_flower_number<-   attr$Sum_flower_number 
+V(net.g)$Synchrony_marquis<-   attr$Synchrony_marquis
+V(net.g)$Distance_to_stream<-   attr$Distance_to_stream
+V(net.g)$Distance_to_tree<-   attr$Distance_to_tree
+V(net.g)$Distance_to_edge<-   attr$Distance_to_edge
+V(net.g)$Neighbour_intra_05m_m2<-   attr$Neighbour_intra_05m_m2
+V(net.g)$Neighbour_inter_05m_m2<-   attr$Neighbour_inter_05m_m2
+V(net.g)$Neighbour_intra_1m_m2<-   attr$Neighbour_intra_1m_m2
+V(net.g)$Neighbour_inter_1m_m2<-   attr$Neighbour_inter_1m_m2
+V(net.g)$Neighbour_intra_2m_m2<-   attr$Neighbour_intra_2m_m2
+V(net.g)$Neighbour_inter_2m_m2<-   attr$Neighbour_inter_2m_m2
+V(net.g)$Neighbour_intra_3m_m2<-   attr$Neighbour_intra_3m_m2 
+V(net.g)$Neighbour_inter_3m_m2<-   attr$Neighbour_inter_3m_m2 
+
+ 
+```
+
+
+# Set matrices and graphs for model testing
+ 
+```{r Bernoulli , echo=TRUE, message= TRUE, warning= TRUE, fig.width=9}
+ 
+# First separating the network into adjacency matrix and attributes
+# Loading vertex attributes 
+
+library(sand)
+AA <- get.adjacency(net.g, attr = "weight")  # create an adjacency matrix from a igraph object
+v.attrs <- get.data.frame(net.g, what="vertices")[1:60,]  # create a datafra, with the attribute variables
+ 
+#v.attrs[nrow(v.attrs)+8,] <- NA
+#v.attrs$type[61:68] <- "TRUE"
+
+
+# Then, I create the analogous network object for ergm and set vertex (i.e. node) attributes in the network object
+ 
+library(ergm) # Will load package 'network' as well.
+
+int.s <- network::as.network(as.matrix(AA),
+                             directed=FALSE, bipartite=60, ignore.eval=FALSE, names.eval='weight') # "bipartite" = number of individual plants in the network
+
+network::set.vertex.attribute(int.s, "Plant_ID",
+                                v.attrs$Plant_ID) 
+#network::set.vertex.attribute(int.s, "Flower_number",
+                                #v.attrs$Flower_number) 
+#network::set.vertex.attribute(int.s, "Pol_richness",
+                                #v.attrs$Pol_richness)
+network::set.vertex.attribute(int.s, "Max_height_m",
+                                v.attrs$Max_height_m)
+network::set.vertex.attribute(int.s, "Mean_height_m",
+                                v.attrs$Mean_height_m)
+network::set.vertex.attribute(int.s, "Area_m2",
+                                v.attrs$Area_m2)
+network::set.vertex.attribute(int.s, "Perimeter_m",
+                                v.attrs$Perimeter_m)
+network::set.vertex.attribute(int.s, "Flower_guide",
+                                v.attrs$Flower_guide)
+network::set.vertex.attribute(int.s, "Flower_size",
+                                v.attrs$Flower_size)
+network::set.vertex.attribute(int.s, "Mean_flower_number",
+                                v.attrs$Mean_flower_number)
+network::set.vertex.attribute(int.s, "Sum_flower_number",
+                                v.attrs$Sum_flower_number)
+network::set.vertex.attribute(int.s, "Synchrony_marquis",
+                                v.attrs$Synchrony_marquis)
+network::set.vertex.attribute(int.s, "Distance_to_stream",
+                                v.attrs$Distance_to_stream)
+network::set.vertex.attribute(int.s, "Distance_to_tree",
+                                v.attrs$Distance_to_tree)
+network::set.vertex.attribute(int.s, "Distance_to_edge",
+                                v.attrs$Distance_to_edge)
+network::set.vertex.attribute(int.s, "Neighbour_intra_05m_m2",
+                                v.attrs$Neighbour_intra_05m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_inter_05m_m2",
+                                v.attrs$Neighbour_inter_05m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_intra_1m_m2",
+                                v.attrs$Neighbour_intra_1m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_inter_1m_m2",
+                                v.attrs$Neighbour_inter_1m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_intra_2m_m2",
+                                v.attrs$Neighbour_intra_2m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_inter_2m_m2",
+                                v.attrs$Neighbour_inter_2m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_intra_3m_m2",
+                                v.attrs$Neighbour_intra_3m_m2)
+network::set.vertex.attribute(int.s, "Neighbour_inter_3m_m2",
+                                v.attrs$Neighbour_inter_3m_m2)
+
+as.matrix(int.s,attrname="weight")
+
+```
+
+# Models with no explanatory variables 
+
+In its simplest form, the model specifications involve statistics that are functions only of the network structure (i.e. controlling for endogenous effects derived from just the pattern of links among nodes).
+
+  * Edges: connections between a node pair (also links, lines, relationships, ties). This term indicates link density. The edges term represents exactly the density of the network (in log-odds). That is, the probability of any tie (aka the density of the network) is the inverse-logit of the coefficient on edges.
+
+  * Geometrically-weighted edgewise shared partners (gwesp) term. It takes a parameter, alfa that controls how much to discount 2nd, 3rd, etc. shared partners. The closer alfa is to zero, the more dramatic the discounting applied to subsequent shared partners. Shows some effects of transitivity.
+  * Geometrically weighted degree (gwdegree) estimates the change in tie likelihood given the degree of the odes involved, but with marginally decreasing weighting as degree increases.
+  
+
+```{r simple models}
+
+
+# Bernoulli, edges is the number of edges in the graph --> it models the hypothesis that edges are randomly distributed in the network
+ergm00 <- formula(int.s ~ edges)  
+
+# kstar and triangle (ej How does the likelihood of a friendship change if two people already have a friend in common?) The implication of a triangles term is that the likelihood of tie changes proportionately to the number of shared friends two people have. That is, if having one shared friend makes a tie 25% more likely, having six shared friends makes a tie 150% more likely.
+ergm01 <- formula(int.s ~ edges + kstar(2)   
+                            + kstar(3) + triangle) 
+
+ergm02 <- formula(int.s ~ edges     # Geometrically weighted degree count
+                    + gwesp(1, fixed=TRUE))
+
+ergm03 <- formula(int.s ~ edges       # Geometrically weighted degree
+                    + gwdegree(1, fixed=TRUE))
+
+
+summary.statistics(ergm00) #edges 208
+summary.statistics(ergm01) #edges 208; kstar2 3338; kstar3 32584, triangle 0
+summary.statistics(ergm02) #edges 208, gwesp.fixed.1 0
+summary.statistics(ergm03) #edges 208, gwdegree 144.388
+ 
+
+```
+
+# Models with explanatory variables
+
+I set six models including different descriptor variables: 
+
+  * Full model including all phenotypic and microsite characteristics of each individual plant
+  * Phenotypic traits and fecundity
+  * Microsite charcateristics
+  * Neighborhood (intraspecific and interspecific)
+
+For the count ERGM, three additional model terms are reported. The sum- term represents an intercept term for edge counts. It controls for the expected number of interactions (i.e., edge counts) in the multi-edge network.
+
+```{r models fit , echo=TRUE, message= TRUE, warning= TRUE}
+
+ergm1 <- formula(int.s ~ sum  
+                        + b1cov("Plant_ID", form= "sum")
+                        + b1cov("Max_height_m", form= "sum")
+                        #+ b1cov("Mean_height_m")
+                        #+ b1cov("Area_m2")
+                        #+ b1cov("Perimeter_m")
+                        + b1cov("Flower_guide", form= "sum")
+                        + b1cov("Flower_size", form= "sum")
+                        #+ b1cov("Mean_flower_number")
+                        + b1cov("Sum_flower_number", form= "sum")
+                        + b1cov("Synchrony_marquis", form= "sum")
+                        #+ b1cov("Total_visits")
+                        + b1cov("Distance_to_stream", form= "sum")
+                        + b1cov("Distance_to_tree", form= "sum")
+                        + b1cov("Distance_to_edge", form= "sum")
+                        #+ b1cov("Neighbour_intra_05m_m2")
+                        #+ b1cov("Neighbour_inter_05m_m2")
+                        + b1cov("Neighbour_intra_1m_m2", form= "sum")
+                        + b1cov("Neighbour_inter_1m_m2", form= "sum")
+                        + b1cov("Neighbour_intra_2m_m2", form= "sum")
+                        + b1cov("Neighbour_inter_2m_m2", form= "sum"))
+                        #+ b1cov("Neighbour_intra_3m_m2")
+                        #+ b1cov("Neighbour_inter_3m_m2"))
+
+ergm2 <- formula(int.s ~ edges  
+                        #+ b1cov("Plant_ID")
+                        + b1cov("Max_height_m")
+                        #+ b1cov("Mean_height_m")
+                        #+ b1cov("Area_m2")
+                        #+ b1cov("Perimeter_m")
+                        + b1cov("Flower_guide")
+                        + b1cov("Flower_size")
+                        #+ b1cov("Mean_flower_number")
+                        + b1cov("Sum_flower_number")
+                        + b1cov("Synchrony_marquis"))
+                        #+ b1cov("Total_visits")
+                        #+ b1cov("Distance_to_stream")
+                        #+ b1cov("Distance_to_tree")
+                        #+ b1cov("Distance_to_edge")
+                        #+ b1cov("Neighbour_intra_05m_m2")
+                        #+ b1cov("Neighbour_inter_05m_m2")
+                        #+ b1cov("Neighbour_intra_1m_m2")
+                        #+ b1cov("Neighbour_inter_1m_m2")
+                        #+ b1cov("Neighbour_intra_2m_m2")
+                        #+ b1cov("Neighbour_inter_2m_m2"))
+                        #+ b1cov("Neighbour_intra_3m_m2")
+                        #+ b1cov("Neighbour_inter_3m_m2"))
+
+ergm3 <- formula(int.s ~ edges  
+                        #+ b1cov("Plant_ID")
+                        #+ b1cov("Max_height_m")
+                        #+ b1cov("Mean_height_m")
+                        #+ b1cov("Area_m2")
+                        #+ b1cov("Perimeter_m")
+                        #+ b1cov("Flower_guide")
+                        #+ b1cov("Flower_size")
+                        #+ b1cov("Mean_flower_number")
+                        #+ b1cov("Sum_flower_number")
+                        #+ b1cov("Synchrony_marquis")
+                        #+ b1cov("Total_visits")
+                        + b1cov("Distance_to_stream")
+                        + b1cov("Distance_to_tree")
+                        + b1cov("Distance_to_edge"))
+                        #+ b1cov("Neighbour_intra_05m_m2")
+                        #+ b1cov("Neighbour_inter_05m_m2")
+                        #+ b1cov("Neighbour_intra_1m_m2")
+                        #+ b1cov("Neighbour_inter_1m_m2")
+                        #+ b1cov("Neighbour_intra_2m_m2")
+                        #+ b1cov("Neighbour_inter_2m_m2"))
+                        #+ b1cov("Neighbour_intra_3m_m2")
+                        #+ b1cov("Neighbour_inter_3m_m2"))
+
+ergm4 <- formula(int.s ~ edges  
+                        #+ b1cov("Plant_ID")
+                        #+ b1cov("Max_height_m")
+                        #+ b1cov("Mean_height_m")
+                        #+ b1cov("Area_m2")
+                        #+ b1cov("Perimeter_m")
+                        #+ b1cov("Flower_guide")
+                        #+ b1cov("Flower_size")
+                        #+ b1cov("Mean_flower_number")
+                        #+ b1cov("Sum_flower_number")
+                        #+ b1cov("Synchrony_marquis")
+                        #+ b1cov("Total_visits")
+                        #+ b1cov("Distance_to_stream")
+                        #+ b1cov("Distance_to_tree")
+                        #+ b1cov("Distance_to_edge")
+                        #+ b1cov("Neighbour_intra_05m_m2")
+                        #+ b1cov("Neighbour_inter_05m_m2")
+                        + b1cov("Neighbour_intra_1m_m2")
+                        + b1cov("Neighbour_inter_1m_m2")
+                        + b1cov("Neighbour_intra_2m_m2")
+                        + b1cov("Neighbour_inter_2m_m2"))
+                        #+ b1cov("Neighbour_intra_3m_m2")
+                        #+ b1cov("Neighbour_inter_3m_m2"))
+
+
+                      
+```
+
+
+```{r model tests , echo=TRUE, message= FALSE, warning= TRUE}
+
+# Model tests
+set.seed(42)
+ergm.fit00 <- ergm(ergm00)  # Bernoulli model
+ergm.fit1 <- ergm(ergm1, response = "weight", reference= ~Poisson)    # Full model
+ergm.fit2 <- ergm(ergm2)    # with phenotypic variables 
+ergm.fit3 <- ergm(ergm3)    # with microhabitat variables 
+ergm.fit4 <- ergm(ergm4)    # with neighbourhood variables
+
+# in order to know the effect of the covariates used at each model, I performed anova for each model
+anova(ergm.fit00, test="Chi") #page 92 book
+anova(ergm.fit1, test="Chi")
+anova(ergm.fit2, test="Chi")
+anova(ergm.fit3, test="Chi")
+anova(ergm.fit4, test="Chi")
+
+
+
+anova(ergm.fit00, ergm.fit1, test="Chi")
+
+m1 = ergm(int.s ~ edges)
+summary(m1)
+all.equal(network.density(int.s), plogis(coef(m1)[[1]]))
+
+summary(ergm.fit1) ## Best model #interpretation of estimates page 94 book
+summary(ergm.fit2)
+summary(ergm.fit3)
+summary(ergm.fit4)
+
+gof.ergm.1 <- gof(ergm.fit1)
+gof.ergm.1
+plot(gof.ergm.1)
+
+
+clip <- pipe("pbcopy", "w")                       
+write.table(as.data.frame(coef(summary(ergm.fit1))), file=clip, sep = '\t', row.names = TRUE)                               
+close(clip)
+
+
+eff1 <- as.data.frame(coef(summary(ergm.fit1))[1:2])
+eff1$exp <- exp(eff1$Estimate)
+eff1 <- tibble::rownames_to_column(eff1)
+names(eff1)[1] <- "variable"
+names(eff1)[3] <- "se"
+type.var <- c(rep("Topological variable", 1), rep("Intrinsic plant attribute", 6), 
+         rep("Extrinsic plant attribute", 7))
+eff1 <- cbind(eff1, type.var)
+eff1$type.var <- factor(type.var)
+eff1$low.CI <- exp(confint(ergm.fit1))[,1]
+eff1$up.CI <- exp(confint(ergm.fit1))[,2]
+
+eff1 <- eff1[-2,] # remove Plant_ID
+
+levels(eff1$type.var)
+
+eff1$variable <- factor(eff1$variable, levels = eff1$variable[order(eff1$type.var)])
+
+
+ggplot(eff1, aes(x=variable, y=Estimate, fill=type.var, colour=type.var)) +
+  geom_hline(yintercept=0, linetype="dashed", lwd=0.6, colour="grey50") + 
+      geom_bar(alpha=0.5, stat="identity", position=position_dodge(0.9), width=0.6) +
+    #geom_errorbar(aes(ymin=Estimate-se, ymax=Estimate+se), width=0.5) + 
+  theme_classic()   + 
+  scale_color_viridis(discrete = TRUE, option = "D")+
+  scale_fill_viridis(discrete = TRUE) + coord_flip()  + scale_x_discrete(breaks=c("edges", "nodecov.Plant_ID", "nodecov.Max_height_m", "nodecov.Flower_guide",
+                            "nodecov.Flower_size", "nodecov.Sum_flower_number", "nodecov.Synchrony_marquis",
+                            "nodecov.Distance_to_stream", "nodecov.Distance_to_tree", "nodecov.Distance_to_edge",
+                            "nodecov.Neighbour_intra_1m_m2", "nodecov.Neighbour_inter_1m_m2",
+                            "nodecov.Neighbour_intra_2m_m2", "nodecov.Neighbour_inter_2m_m2"), 
+                   labels=c("Edges", "Plant ID", "Maximum height", "Flower guide size", "Flower size", 
+                            "Total number of flowers", "Flowering synchrony", "Distance to stream", 
+                            "Distance to tree", "Distance to edge", "Intraspecific neighbours r=1m",
+                            "Interspecific neighbours r=1m", "Intraspecific neighbours r=2m", 
+                            "Interspecific neighbours r=2m")) + theme(axis.title.y = element_blank()) +
+  theme(axis.text.x = element_text(size = 15, margin = margin(t = 15, r = 0, b = 0, l = 0)), 
+    axis.text.y = element_text(size = 15, margin = margin(t = 0, r = 15, b = 0, l = 0)), 
+    legend.text = element_text(size = 15), legend.key.size = unit(1.0, "cm"),
+    axis.title=element_text(size=16,face="bold"),
+    legend.title = element_blank()) + guides(fill = guide_legend(reverse = TRUE), 
+                                             colour= guide_legend(reverse = TRUE))
+
+
+## Exponentiated estimates
+levels(eff1$type.var)
+
+eff1$variable <- factor(eff1$variable, levels = eff1$variable[order(eff1$type.var)])
+
+ggplot(eff1, aes(x=variable, y=exp, fill=type.var, colour=type.var)) +
+  geom_hline(yintercept=1, linetype="dashed", lwd=0.6, colour="grey50") + 
+geom_pointrange(aes(ymin = low.CI, ymax = up.CI), size=1.3) + 
+  theme_classic()  + 
+  scale_fill_brewer(palette="Dark2") + scale_colour_brewer(palette="Dark2") + coord_flip()  + scale_x_discrete(breaks=c("edges", "nodecov.Plant_ID", "nodecov.Max_height_m", "nodecov.Flower_guide",
+                            "nodecov.Flower_size", "nodecov.Sum_flower_number", "nodecov.Synchrony_marquis",
+                            "nodecov.Distance_to_stream", "nodecov.Distance_to_tree", "nodecov.Distance_to_edge",
+                            "nodecov.Neighbour_intra_1m_m2", "nodecov.Neighbour_inter_1m_m2",
+                            "nodecov.Neighbour_intra_2m_m2", "nodecov.Neighbour_inter_2m_m2"), 
+                   labels=c("Edges", "Plant ID", "Maximum height", "Flower guide size", "Flower size", 
+                            "Total number of flowers", "Flowering synchrony", "Distance to stream", 
+                            "Distance to tree", "Distance to edge", "Intraspecific neighbours r=1m",
+                            "Interspecific neighbours r=1m", "Intraspecific neighbours r=2m", 
+                            "Interspecific neighbours r=2m")) + theme(axis.title.y = element_blank()) +
+  theme(axis.text.x = element_text(size = 15, margin = margin(t = 15, r = 0, b = 0, l = 0)), 
+    axis.text.y = element_text(size = 15, margin = margin(t = 0, r = 15, b = 0, l = 0)), 
+    legend.text = element_text(size = 15), legend.key.size = unit(1.0, "cm"),
+    axis.title=element_text(size=16,face="bold"),
+    legend.title = element_blank())
+
+#+ annotate(geom="text", x=c(13.75, 12.75, 7.75, 5.75, 2.75, 1.75), 
+#           y=c(-0.55, 0.32, 0.62, -0.38, -0.48, 0.55), label="*", size=8)
+
+
+
+
+require(MuMIn)
+library(dplyr)
+
+
+
+
+bic<- round(BIC(ergm.fit1, ergm.fit2, ergm.fit3, ergm.fit4),2)
+
+aic<- round(Weights(AICc(ergm.fit1, ergm.fit2, ergm.fit3, ergm.fit4)), 2)
+
+model.summ<- arrange(data.frame("model"= row.names(bic), 
+                     bic, "AICw"= aic), desc(AICw))
+model.summ
+
+
+
+```
+
+## ERGMs with unipartite networks
+
+```{r corrected.unipartite}
+
+#uni.weights <- read.csv("weight_values_matrix.csv", sep=",") # unipartite projection controlling for distance
+#uni.weights <- as.matrix(uni.weights[,2:61])
+
+
+uni.distance <- read.csv("distance_matrix.csv", sep=",") # spatial distance between plants
+uni.distance <- as.matrix(uni.distance[,2:61])
+
+
+```
+
+
+```{r ergm.uni}
+
+
+uni <- as.one.mode(as.matrix(int), project="lower") # unipartite projection
+
+uni.g <- graph.adjacency(uni, mode = "undirected", weighted = TRUE, diag = FALSE) # igraph object
+
+uni.edg<- as_edgelist(uni.g) # not really necessary
+
+
+ 
+# Subsetting the covariates from the main dataset
+# phenotypic and microsite variation among plant individuals
+
+att.fit <- data %>%  
+           dplyr::select(c(1, 25:51)) 
+
+att.fit$Fitness <- att.fit$Sum_flower_number * att.fit$Fruit_set * att.fit$Seed_set
+norm <- (att.fit$Seed_mass - min(att.fit$Seed_mass)) / (max(att.fit$Seed_mass) - min(att.fit$Seed_mass))
+att.fit$Fitness_w <- att.fit$Sum_flower_number * att.fit$Fruit_set * att.fit$Seed_set * norm
+
+att.fit$Fitness_norm <- (att.fit$Fitness_w - min(att.fit$Fitness_w)) / (max(att.fit$Fitness_w) - min(att.fit$Fitness_w))
+
+#att.fit$Fitness_norm <- scale(att.fit$Fitness_w)
+
+
+att.fit$Max_height_m <- scale(att.fit$Max_height_m)
+att.fit$Flower_guide <- scale(att.fit$Flower_guide)
+att.fit$Flower_size <- scale(att.fit$Flower_size)
+att.fit$Sum_flower_number <- scale(att.fit$Sum_flower_number)
+att.fit$Synchrony_marquis <- scale(att.fit$Synchrony_marquis)
+att.fit$Distance_to_stream <- scale(att.fit$Distance_to_stream)
+att.fit$Distance_to_tree <- scale(att.fit$Distance_to_tree)
+att.fit$Distance_to_edge <- scale(att.fit$Distance_to_edge)
+att.fit$Neighbour_intra_1m_m2 <- scale(att.fit$Neighbour_intra_1m_m2)
+att.fit$Neighbour_inter_1m_m2 <- scale(att.fit$Neighbour_inter_1m_m2)
+att.fit$Neighbour_intra_2m_m2 <- scale(att.fit$Neighbour_intra_2m_m2)
+att.fit$Neighbour_inter_2m_m2 <- scale(att.fit$Neighbour_inter_2m_m2)
+
+# Create the attributes matrix (igraph object)
+V(uni.g)$Plant_ID<-     att.fit$Plant_ID
+V(uni.g)$Max_height_m<-     att.fit$Max_height_m
+V(uni.g)$Mean_height_m<-     att.fit$Mean_height_m
+V(uni.g)$Area_m2<-   att.fit$Area_m2
+V(uni.g)$Perimeter_m<-   att.fit$Perimeter_m
+V(uni.g)$Flower_guide<-   att.fit$Flower_guide
+V(uni.g)$Flower_size<-   att.fit$Flower_size 
+V(uni.g)$Mean_flower_number<-   att.fit$Mean_flower_number
+V(uni.g)$Sum_flower_number<-   att.fit$Sum_flower_number 
+V(uni.g)$Synchrony_marquis<-   att.fit$Synchrony_marquis
+V(uni.g)$Distance_to_stream<-   att.fit$Distance_to_stream
+V(uni.g)$Distance_to_tree<-   att.fit$Distance_to_tree
+V(uni.g)$Distance_to_edge<-   att.fit$Distance_to_edge
+V(uni.g)$Neighbour_intra_05m_m2<-   att.fit$Neighbour_intra_05m_m2
+V(uni.g)$Neighbour_inter_05m_m2<-   att.fit$Neighbour_inter_05m_m2
+V(uni.g)$Neighbour_intra_1m_m2<-   att.fit$Neighbour_intra_1m_m2
+V(uni.g)$Neighbour_inter_1m_m2<-   att.fit$Neighbour_inter_1m_m2
+V(uni.g)$Neighbour_intra_2m_m2<-   att.fit$Neighbour_intra_2m_m2
+V(uni.g)$Neighbour_inter_2m_m2<-   att.fit$Neighbour_inter_2m_m2
+V(uni.g)$Neighbour_intra_3m_m2<-   att.fit$Neighbour_intra_3m_m2 
+V(uni.g)$Neighbour_inter_3m_m2<-   att.fit$Neighbour_inter_3m_m2 
+V(uni.g)$Fruit_set<-   att.fit$Fruit_set 
+V(uni.g)$Seed_set<-   att.fit$Seed_set 
+V(uni.g)$Seed_mass<-   att.fit$Seed_mass
+V(uni.g)$Fitness_w<-   att.fit$Fitness_w 
+V(uni.g)$Fitness_norm<-   att.fit$Fitness_norm 
+
+
+# First separating the network into adjacency matrix and attributes
+# Loading vertex attributes
+
+uni.AA <- get.adjacency(uni.g, attr = "weight")
+uni.v.attrs <- get.data.frame(uni.g, what="vertices")[1:60,]
+
+
+# network object for ergm 
+
+uni.s <- network::as.network(as.matrix(uni.AA),
+                             directed=FALSE, ignore.eval=FALSE, names.eval='weight') 
+summary(uni.s)
+as.matrix(uni.s,attrname="weight") # We can view the weight attribute as a matrix
+plot(uni.s)
+get.edge.attribute(uni.s, "weight")
+
+
+network::set.vertex.attribute(uni.s, "Plant_ID",
+                                uni.v.attrs$Plant_ID) 
+network::set.vertex.attribute(uni.s, "Max_height_m",
+                                uni.v.attrs$Max_height_m)
+network::set.vertex.attribute(uni.s, "Mean_height_m",
+                                uni.v.attrs$Mean_height_m)
+network::set.vertex.attribute(uni.s, "Area_m2",
+                                uni.v.attrs$Area_m2)
+network::set.vertex.attribute(uni.s, "Perimeter_m",
+                                uni.v.attrs$Perimeter_m)
+network::set.vertex.attribute(uni.s, "Flower_guide",
+                                uni.v.attrs$Flower_guide)
+network::set.vertex.attribute(uni.s, "Flower_size",
+                                uni.v.attrs$Flower_size)
+network::set.vertex.attribute(uni.s, "Mean_flower_number",
+                                uni.v.attrs$Mean_flower_number)
+network::set.vertex.attribute(uni.s, "Sum_flower_number",
+                                uni.v.attrs$Sum_flower_number)
+network::set.vertex.attribute(uni.s, "Synchrony_marquis",
+                                uni.v.attrs$Synchrony_marquis)
+network::set.vertex.attribute(uni.s, "Distance_to_stream",
+                                uni.v.attrs$Distance_to_stream)
+network::set.vertex.attribute(uni.s, "Distance_to_tree",
+                                uni.v.attrs$Distance_to_tree)
+network::set.vertex.attribute(uni.s, "Distance_to_edge",
+                                uni.v.attrs$Distance_to_edge)
+network::set.vertex.attribute(uni.s, "Neighbour_intra_05m_m2",
+                                uni.v.attrs$Neighbour_intra_05m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_inter_05m_m2",
+                                uni.v.attrs$Neighbour_inter_05m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_intra_1m_m2",
+                                uni.v.attrs$Neighbour_intra_1m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_inter_1m_m2",
+                                uni.v.attrs$Neighbour_inter_1m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_intra_2m_m2",
+                                uni.v.attrs$Neighbour_intra_2m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_inter_2m_m2",
+                                uni.v.attrs$Neighbour_inter_2m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_intra_3m_m2",
+                                uni.v.attrs$Neighbour_intra_3m_m2)
+network::set.vertex.attribute(uni.s, "Neighbour_inter_3m_m2",
+                                uni.v.attrs$Neighbour_inter_3m_m2)
+network::set.vertex.attribute(uni.s, "Fruit_set",
+                                uni.v.attrs$Fruit_set)
+network::set.vertex.attribute(uni.s, "Seed_set",
+                                uni.v.attrs$Seed_set)
+network::set.vertex.attribute(uni.s, "Seed_mass",
+                                uni.v.attrs$Seed_mass)
+network::set.vertex.attribute(uni.s, "Fitness_w",
+                                uni.v.attrs$Fitness_w)
+network::set.vertex.attribute(uni.s, "Fitness_norm",
+                                uni.v.attrs$Fitness_norm)
+
+```
+
+
+
+```{r ergm.uni.models}
+
+uni.ergm00 <- formula(uni.s ~ edges)  
+
+summary.statistics(uni.ergm00) # 1478
+           
+set.network.attribute(uni.s, "distance", uni.distance) # spatial distance between plants
+#set.network.attribute(uni.s, "weight", uni) # already set
+as.matrix(uni.s, attrname = "weight")[1:5, 1:5] # check weights
+as.matrix(uni.s)[1:5, 1:5] # check binary matrix
+
+
+## example
+data(samplk)
+samplk.tot.m <- as.matrix(samplk1) + as.matrix(samplk2) + as.matrix(samplk3)
+str(samplk.tot.m)
+samplk.tot <- as.network(samplk.tot.m, directed = TRUE, matrix.type = "a", ignore.eval = FALSE, 
+    names.eval = "nominations")
+summary(samplk.tot ~ sum, response = "nominations")
+
+test <- ergm(uni.s ~ sum, 
+    response = "weight", reference = ~Binomial(3))
+summary(test)
+##
+
+
+uni.ergm1 <- formula(uni.s ~ sum  
+                        #+ nodemain("Plant_ID", form= "sum")
+                        + nodemain("Max_height_m", form= "sum")
+                        #+ nodemain("Mean_height_m")
+                        #+ nodemain("Area_m2")
+                        #+ nodemain("Perimeter_m")
+                        + nodemain("Flower_guide", form= "sum")
+                        + nodemain("Flower_size", form= "sum")
+                        #+ nodemain("Mean_flower_number")
+                        + nodemain("Sum_flower_number", form= "sum")
+                        + nodemain("Synchrony_marquis", form= "sum")
+                        #+ nodemain("Total_visits")
+                        + nodemain("Distance_to_stream", form= "sum")
+                        + nodemain("Distance_to_tree", form= "sum")
+                        + nodemain("Distance_to_edge", form= "sum")
+                        #+ nodemain("Neighbour_intra_05m_m2")
+                        #+ nodemain("Neighbour_inter_05m_m2")
+                        + nodemain("Neighbour_intra_1m_m2", form= "sum")
+                        + nodemain("Neighbour_inter_1m_m2", form= "sum")
+                        + nodemain("Neighbour_intra_2m_m2", form= "sum")
+                        + nodemain("Neighbour_inter_2m_m2", form= "sum")
+                        #+ nodemain("Neighbour_intra_3m_m2")
+                        #+ nodemain("Neighbour_inter_3m_m2"))
+                        #+ nodemain("Fruit_set")
+                        #+ nodemain("Seed_set")
+                        #+ nodemain("Seed_mass"))
+                        #+ nodemain("Fitness"))
+                        + nodemain("Fitness_norm", form= "sum") 
+                        + edgecov("distance"))
+
+
+uni.ergm2 <- formula(uni.s ~ edges  
+                        + nodemain("Plant_ID")
+                        + nodemain("Max_height_m")
+                        #+ nodemain("Mean_height_m")
+                        #+ nodemain("Area_m2")
+                        #+ nodemain("Perimeter_m")
+                        + nodemain("Flower_guide")
+                        + nodemain("Flower_size")
+                        #+ nodemain("Mean_flower_number")
+                        + nodemain("Sum_flower_number")
+                        + nodemain("Synchrony_marquis")
+                        #+ nodemain("Total_visits")
+                        #+ nodemain("Distance_to_stream")
+                        #+ nodemain("Distance_to_tree")
+                        #+ nodemain("Distance_to_edge")
+                        #+ nodemain("Neighbour_intra_05m_m2")
+                        #+ nodemain("Neighbour_inter_05m_m2")
+                        #+ nodemain("Neighbour_intra_1m_m2")
+                        #+ nodemain("Neighbour_inter_1m_m2")
+                        #+ nodemain("Neighbour_intra_2m_m2")
+                        #+ nodemain("Neighbour_inter_2m_m2"))
+                        #+ nodemain("Neighbour_intra_3m_m2")
+                        #+ nodemain("Neighbour_inter_3m_m2"))
+                        + nodemain("Fitness_norm"))
+
+uni.ergm3 <- formula(uni.s ~ edges  
+                        + nodemain("Plant_ID")
+                        #+ nodemain("Max_height_m")
+                        #+ nodemain("Mean_height_m")
+                        #+ nodemain("Area_m2")
+                        #+ nodemain("Perimeter_m")
+                        #+ nodemain("Flower_guide")
+                        #+ nodemain("Flower_size")
+                        #+ nodemain("Mean_flower_number")
+                        #+ nodemain("Sum_flower_number")
+                        #+ nodemain("Synchrony_marquis")
+                        #+ nodemain("Total_visits")
+                        + nodemain("Distance_to_stream")
+                        + nodemain("Distance_to_tree")
+                        + nodemain("Distance_to_edge")
+                        #+ nodemain("Neighbour_intra_05m_m2")
+                        #+ nodemain("Neighbour_inter_05m_m2")
+                        #+ nodemain("Neighbour_intra_1m_m2")
+                        #+ nodemain("Neighbour_inter_1m_m2")
+                        #+ nodemain("Neighbour_intra_2m_m2")
+                        #+ nodemain("Neighbour_inter_2m_m2"))
+                        #+ nodemain("Neighbour_intra_3m_m2")
+                        #+ nodemain("Neighbour_inter_3m_m2"))
+                        + nodemain("Fitness_norm"))
+
+uni.ergm4 <- formula(uni.s ~ edges  
+                        + nodemain("Plant_ID")
+                        #+ nodemain("Max_height_m")
+                        #+ nodemain("Mean_height_m")
+                        #+ nodemain("Area_m2")
+                        #+ nodemain("Perimeter_m")
+                        #+ nodemain("Flower_guide")
+                        #+ nodemain("Flower_size")
+                        #+ nodemain("Mean_flower_number")
+                        #+ nodemain("Sum_flower_number")
+                        #+ nodemain("Synchrony_marquis")
+                        #+ nodemain("Total_visits")
+                        #+ nodemain("Distance_to_stream")
+                        #+ nodemain("Distance_to_tree")
+                        #+ nodemain("Distance_to_edge")
+                        #+ nodemain("Neighbour_intra_05m_m2")
+                        #+ nodemain("Neighbour_inter_05m_m2")
+                        + nodemain("Neighbour_intra_1m_m2")
+                        + nodemain("Neighbour_inter_1m_m2")
+                        + nodemain("Neighbour_intra_2m_m2")
+                        + nodemain("Neighbour_inter_2m_m2")
+                        #+ nodemain("Neighbour_intra_3m_m2")
+                        #+ nodemain("Neighbour_inter_3m_m2"))
+                        + nodemain("Fitness_norm"))
+
+uni.ergm5 <- formula(uni.s ~ edges  
+                        + nodemain("Plant_ID")
+                        #+ nodemain("Max_height_m")
+                        #+ nodemain("Mean_height_m")
+                        #+ nodemain("Area_m2")
+                        #+ nodemain("Perimeter_m")
+                        #+ nodemain("Flower_guide")
+                        #+ nodemain("Flower_size")
+                        #+ nodemain("Mean_flower_number")
+                        #+ nodemain("Sum_flower_number")
+                        #+ nodemain("Synchrony_marquis")
+                        #+ nodemain("Total_visits")
+                        #+ nodemain("Distance_to_stream")
+                        #+ nodemain("Distance_to_tree")
+                        #+ nodemain("Distance_to_edge")
+                        #+ nodemain("Neighbour_intra_05m_m2")
+                        #+ nodemain("Neighbour_inter_05m_m2")
+                        #+ nodemain("Neighbour_intra_1m_m2")
+                        #+ nodemain("Neighbour_inter_1m_m2")
+                        #+ nodemain("Neighbour_intra_2m_m2")
+                        #+ nodemain("Neighbour_inter_2m_m2")
+                        #+ nodemain("Neighbour_intra_3m_m2")
+                        #+ nodemain("Neighbour_inter_3m_m2"))
+                        + nodemain("Fitness_norm"))
+
+
+
+
+
+
+# Model tests
+# 
+set.seed(42)
+uni.ergm.fit00 <- ergm(uni.ergm00)  # Bernoulli model
+uni.ergm.fit1 <- ergm(uni.ergm1, response ="weight", reference= ~Poisson)    # Full model
+uni.ergm.fit2 <- ergm(uni.ergm2)    # with phenotypic variables
+uni.ergm.fit3 <- ergm(uni.ergm3)    # with microhabitat variables
+uni.ergm.fit4 <- ergm(uni.ergm4)    # with neighbourhood variables
+uni.ergm.fit5 <- ergm(uni.ergm5)    # only with fitness
+
+
+summary(uni.ergm.fit00) 
+summary(uni.ergm.fit1) ## Best model #interpretation of estimates page 94 book
+summary(uni.ergm.fit2) 
+summary(uni.ergm.fit3) 
+summary(uni.ergm.fit4) 
+summary(uni.ergm.fit5) 
+
+
+unigof.ergm.1 <- gof(uni.ergm.fit1)
+unigof.ergm.1
+plot(unigof.ergm.1)
+
+all.equal(network.density(uni.s), plogis(coef(uni.ergm.fit00)[[1]]))
+
+clip <- pipe("pbcopy", "w")                       
+write.table(as.data.frame(coef(summary(uni.ergm.fit1))), file=clip, sep = '\t', row.names = TRUE)                               
+close(clip)
+
+
+# Effect size plots 
+
+eff2 <- as.data.frame(coef(summary(uni.ergm.fit1))[1])
+eff2$exp <- exp(eff2$Estimate)
+eff2 <- tibble::rownames_to_column(eff2)
+names(eff2)[1] <- "variable"
+type.var <- c(rep("Topological variable", 1), rep("Intrinsic plant attribute", 6), 
+         rep("Extrinsic plant attribute", 7), rep("Intrinsic plant attribute", 1), rep("Edge attribute"))
+eff2 <- cbind(eff2, type.var)
+eff2$type.var <- factor(type.var)
+eff2$low.CI <- exp(confint(uni.ergm.fit1))[,1]
+eff2$up.CI <- exp(confint(uni.ergm.fit1))[,2]
+
+eff2 <- eff2[-2, ] # remove plant_ID
+
+levels(eff2$type.var)
+
+eff2$variable <- factor(eff2$variable, levels = eff2$variable[order(eff2$type.var)])
+#eff2 <- eff2[-1,]
++ 
+  scale_color_viridis(discrete = TRUE, option = "D")+
+  scale_fill_viridis(discrete = TRUE)
+
+ggplot(eff2, aes(x=variable, y=Estimate, fill=type.var, colour=type.var)) +
+  geom_hline(yintercept=0, linetype="dashed", lwd=0.6, colour="grey50") + 
+      geom_bar(alpha=0.5, stat="identity", position=position_dodge(0.9), 
+               width=0.5) + theme_classic()  + 
+  scale_fill_manual(values=c("grey50", "#440154FF", "#21908CFF", "#FDE725FF")) +
+  scale_colour_manual(values=c("grey50", "#440154FF", "#21908CFF", "#FDE725FF")) + coord_flip()  + scale_x_discrete(breaks=c("edges", "nodecov.Plant_ID", "nodecov.Max_height_m", "nodecov.Flower_guide",
+                            "nodecov.Flower_size", "nodecov.Sum_flower_number",
+                            "nodecov.Synchrony_marquis", "nodecov.Distance_to_stream",
+                            "nodecov.Distance_to_tree", "nodecov.Distance_to_edge",
+                            "nodecov.Neighbour_intra_1m_m2", "nodecov.Neighbour_inter_1m_m2", 
+                            "nodecov.Neighbour_intra_2m_m2", "nodecov.Neighbour_inter_2m_m2",
+                            "nodecov.Fitness_norm", "edgecov.distance"), 
+                   labels=c("Edges", "Plant ID", "Maximum height", "Flower guide size", "Flower size", 
+                            "Total number of flowers", "Flowering synchrony", "Distance to stream", 
+                            "Distance to tree", "Distance to edge", "Intraspecific neighbours r=1m",
+                            "Interspecific neighbours r=1m", "Intraspecific neighbours r=2m", 
+                            "Interspecific neighbours r=2m", "FRS", "Spatial distance between plants")) +
+  theme(axis.title.y = element_blank()) +
+  theme(axis.text.x = element_text(size = 15, margin = margin(t = 15, r = 0, b = 0, l = 0)), 
+    axis.text.y = element_text(size = 15, margin = margin(t = 0, r = 15, b = 0, l = 0)), 
+    legend.text = element_text(size = 15), legend.key.size = unit(1.0, "cm"),
+    axis.title=element_text(size=16,face="bold"),
+    legend.title = element_blank()) + guides(fill = guide_legend(reverse = TRUE), 
+                                             colour= guide_legend(reverse = TRUE))
+
+
+## Exponentiated estimates
+
+ggplot(eff2, aes(x=variable, y=exp, fill=type.var, colour=type.var)) +
+  geom_hline(yintercept=1, linetype="dashed", lwd=0.6, colour="grey50") + 
+geom_pointrange(aes(ymin = low.CI, ymax = up.CI), size=1.3) + 
+  theme_classic()  + 
+  scale_fill_brewer(palette="Dark2") + scale_colour_brewer(palette="Dark2") + coord_flip()  + scale_x_discrete(breaks=c("edges", "nodecov.Plant_ID", "nodecov.Max_height_m", "nodecov.Flower_guide",
+                            "nodecov.Flower_size", "nodecov.Sum_flower_number", "nodecov.Synchrony_marquis",
+                            "nodecov.Distance_to_stream", "nodecov.Distance_to_tree", "nodecov.Distance_to_edge",
+                            "nodecov.Neighbour_intra_1m_m2", "nodecov.Neighbour_inter_1m_m2",
+                            "nodecov.Neighbour_intra_2m_m2", "nodecov.Neighbour_inter_2m_m2"), 
+                   labels=c("Edges", "Plant ID", "Maximum height", "Flower guide size", "Flower size", 
+                            "Total number of flowers", "Flowering synchrony", "Distance to stream", 
+                            "Distance to tree", "Distance to edge", "Intraspecific neighbours r=1m",
+                            "Interspecific neighbours r=1m", "Intraspecific neighbours r=2m", 
+                            "Interspecific neighbours r=2m")) + theme(axis.title.y = element_blank()) +
+  theme(axis.text.x = element_text(size = 15, margin = margin(t = 15, r = 0, b = 0, l = 0)), 
+    axis.text.y = element_text(size = 15, margin = margin(t = 0, r = 15, b = 0, l = 0)), 
+    legend.text = element_text(size = 15), legend.key.size = unit(1.0, "cm"),
+    axis.title=element_text(size=16,face="bold"),
+    legend.title = element_blank())
+
+#+ annotate(geom="text", x=c(13.75, 12.75, 7.75, 5.75, 2.75, 1.75), 
+#           y=c(-0.55, 0.32, 0.62, -0.38, -0.48, 0.55), label="*", size=8)
+
+
+
+```
+
+# ERGMs with weighted networks
+
+```{r ergm.count}
+
+## weights
+
+summary(uni.s~sum, response="weight")
+
+#binomial
+p <- sum(uni.s %e% "weight")/3/network.dyadcount(uni.s)
+p
+uni.s.init <- log(p/(1-p)) # i.e., logit(p)
+uni.s.init
+# poisson
+m <- sum(uni.s %e% "weight")/network.dyadcount(uni.s)
+m
+uni.s.init <- log(m)
+uni.s.init
+
+# run ergm
+lead <- ergm(uni.s~ sum + nodemain("Fitness_norm", form="sum"),
+             response="weight", reference=~Poisson,
+             control=control.ergm(init=c(uni.s.init, 0)))
+
+lead2 <- ergm(uni.s~ sum + nodemain("Fitness_norm", form="sum") + nodemain("Synchrony_marquis", form="sum"),
+             response="weight", reference=~Poisson,
+             control=control.ergm(init=c(uni.s.init, 0)))  # it doesn't work
+
+mcmc.diagnostics(lead)
+summary(lead)
+
+
+search.ergmTerms(categories="valued")
+
+```
+
+## GERGM package --> quantitative ERGMs
+
+```{r gergm}
+
+install.packages("GERGM")
+install.packages("devtools")
+devtools::install_github("matthewjdenny/GERGM")
+library(GERGM)
+
+set.seed(12345)
+data("lending_2005")
+data("covariate_data_2005")
+data("net_exports_2005")
+plot_network(lending_2005) 
+
+plot_network(uni)
+
+formula <- lending_2005 ~ edges + mutual(alpha = 0.8) + sender("log_GDP") + 
+  receiver("log_GDP") + nodemix("G8", base = "No") + netcov(net_exports_2005) 
+
+test <- gergm(formula,
+              covariate_data = covariate_data_2005,
+                number_of_networks_to_simulate = 40000,
+                thin = 1/100,
+                proposal_variance = 0.05,
+                MCMC_burnin = 10000,
+                seed = 456,
+                convergence_tolerance = 0.5)
+
+Estimate_Plot(test)
+
+```
+
