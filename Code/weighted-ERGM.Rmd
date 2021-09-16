@@ -15,6 +15,7 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r initialize, message= FALSE, warning=FALSE}
 
+library(plyr)
 library(sand)
 library(robustbase)
 library(ergm) # Will load package 'network' as well.
@@ -34,122 +35,45 @@ library(ergm.count)
 ```
  
  
-# Read data and test collinearity
-
-Here I removed all redundant predictor variables after testing for multicollinearity. First, I checked it using VIF factors and then I calculated the correlation coefficients between pairs of predictors and set the threshold to P< 0.05 and r> 0.3.
+# Read data
 
 ```{r collinearity, message= FALSE, warning=FALSE}
 
 # read interaction data
-rocina <- read.table("../Database/rocina_halimium_09072019.csv", sep=";", header=T)
-rocina$N_visitations <- as.numeric(rocina$N_visitations)
-pol.fg <- rocina[,c(6,7)]
-rocina <- rocina[,c(5,6,8)]
+int.data <- read.table("Data/rocina_halimium_09072019.csv", sep=";", header=T)
+str(int.data)
+int.data$N_visits <- as.numeric(int.data$N_visits)
 
-# interaction matrix (individual plants x pollinator species)
-rocina.m <- dcast(rocina, Plant_ID ~ Pollinator_sp, value.var="N_visitations", fun.aggregate = sum)
-rocina.m$nothing <- NULL
-rocina.m$Butterfly <- NULL
 
-# read plant attributes
-individual <- read.table("../Database/individual_data_halimium_20190714.csv", sep=";", header=T)
-data <- merge(rocina.m, individual, by="Plant_ID")
+# create interaction matrix (individual plants x pollinator species)
+int.matrix <- dcast(int.data %>%dplyr::select(Plant_ID, Pollinator_sp, N_visits), 
+                    Plant_ID ~ Pollinator_sp, value.var="N_visits", fun.aggregate = sum)
 
-# test VIF factors
-vif_func<-function(in_frame,thresh=10,trace=T,...){
-	
-	require(fmsb)
-	
-	if(class(in_frame) != 'data.frame') in_frame<-data.frame(in_frame)
-	
-	#get initial vif value for all comparisons of variables
-	vif_init<-NULL
-	var_names <- names(in_frame)
-	for(val in var_names){
-		regressors <- var_names[-which(var_names == val)]
-		form <- paste(regressors, collapse = '+')
-		form_in <- formula(paste(val, '~', form))
-		vif_init<-rbind(vif_init, c(val, VIF(lm(form_in, data = in_frame, ...))))
-	}
-	vif_max<-max(as.numeric(vif_init[,2]), na.rm = TRUE)
-	
-	if(vif_max < thresh){
-		if(trace==T){ #print output of each iteration
-			prmatrix(vif_init,collab=c('var','vif'),rowlab=rep('',nrow(vif_init)),quote=F)
-			cat('\n')
-			cat(paste('All variables have VIF < ', thresh,', max VIF ',round(vif_max,2), sep=''),'\n\n')
-		}
-		return(var_names)
-	}
-	else{
-		
-		in_dat<-in_frame
-		
-		#backwards selection of explanatory variables, stops when all VIF values are below 'thresh'
-		while(vif_max >= thresh){
-			
-			vif_vals<-NULL
-			var_names <- names(in_dat)
-			
-			for(val in var_names){
-				regressors <- var_names[-which(var_names == val)]
-				form <- paste(regressors, collapse = '+')
-				form_in <- formula(paste(val, '~', form))
-				vif_add<-VIF(lm(form_in, data = in_dat, ...))
-				vif_vals<-rbind(vif_vals,c(val,vif_add))
-			}
-			max_row<-which(vif_vals[,2] == max(as.numeric(vif_vals[,2]), na.rm = TRUE))[1]
-			
-			vif_max<-as.numeric(vif_vals[max_row,2])
-			
-			if(vif_max<thresh) break
-			
-			if(trace==T){ #print output of each iteration
-				prmatrix(vif_vals,collab=c('var','vif'),rowlab=rep('',nrow(vif_vals)),quote=F)
-				cat('\n')
-				cat('removed: ',vif_vals[max_row,1],vif_max,'\n\n')
-				flush.console()
-			}
-			
-			in_dat<-in_dat[,!names(in_dat) %in% vif_vals[max_row,1]]
-			
-		}
-		
-		return(names(in_dat))
-		
-	}
-	
-}
-x <- data %>%  
-           dplyr::select(c(25:51))  # Select predictor variables
-str(x)
-
-res2 <- rcorr(as.matrix(x))
-res2$P
-which(res2$P < 0.05)
-
-res2$P[] < 0.05 & res2$r[] > 0.3 
+# read plant attributes and merge with the interaction matrix
+trait.data <- read.table("Data/individual_data_halimium_20190714.csv", sep=";", header=T)
+complete.df <- merge(int.matrix, trait.data, by="Plant_ID")
 
 ```
 
  
-# Bipartite network: set node attibutes 
+# Bipartite network: set node attibutes in igraph object
 
-The 'data' dataframe comprises both interaction data and plant attributes. First, I selected only interactions (2:22 columns) to create a graph object from the incidence matrix. Second, I selected the plant attributes' columns and scaled all variables to allow meaninful comparisons. Third, I associated each vertex of the graph (i.e. each individual plant node) with tehir plant attributes with V().
+The 'complete.df' dataframe comprises both interaction data and plant attributes. First, I selected only interactions (2:22 columns) to create a graph object from the incidence matrix. Second, I selected the plant attribute columns and scaled all variables to allow meaninful comparisons. Third, I associated each vertex of the graph (i.e. each individual plant node) with their plant attributes with V().
 
 ```{r bi.nodes, echo= TRUE, message= TRUE, warning= FALSE, fig.width= 9}
  
-int <- data %>% 
+# Subset interaction data
+pol.int <- complete.df %>% 
            dplyr::select(2:22) 
            
-net.g<- graph_from_incidence_matrix(int, weighted= T, add.names=NULL) # using an incidence matrix (interaction data) to create an igraph object
-net.edg<- as_edgelist(net.g)  # not really necessary
+bi.g <- graph_from_incidence_matrix(pol.int, weighted= T, add.names=NULL) # create the igraph object
 
  
-# Subsetting the covariates from the main dataset (phenotypic and microsite variation among plant individuals)
-attr <- data %>%  
+# Subset the covariates from the main dataset (phenotypic and microsite variation among plant individuals)
+attr <- complete.df %>%  
            dplyr::select(c(1, 25:51)) 
 
+# Scale the predictor variables I will use in the models
 attr$Max_height_m <- scale(attr$Max_height_m)
 attr$Flower_guide <- scale(attr$Flower_guide)
 attr$Flower_size <- scale(attr$Flower_size)
@@ -163,111 +87,98 @@ attr$Neighbour_inter_1m_m2 <- scale(attr$Neighbour_inter_1m_m2)
 attr$Neighbour_intra_2m_m2 <- scale(attr$Neighbour_intra_2m_m2)
 attr$Neighbour_inter_2m_m2 <- scale(attr$Neighbour_inter_2m_m2)
                  
-       
-# Create the attributes' matrix
-V(net.g)$Plant_ID<-     attr$Plant_ID
-V(net.g)$Max_height_m<-     attr$Max_height_m
-V(net.g)$Mean_height_m<-     attr$Mean_height_m
-V(net.g)$Area_m2<-   attr$Area_m2
-V(net.g)$Perimeter_m<-   attr$Perimeter_m
-V(net.g)$Flower_guide<-   attr$Flower_guide
-V(net.g)$Flower_size<-   attr$Flower_size 
-V(net.g)$Mean_flower_number<-   attr$Mean_flower_number
-V(net.g)$Sum_flower_number<-   attr$Sum_flower_number 
-V(net.g)$Synchrony_marquis<-   attr$Synchrony_marquis
-V(net.g)$Distance_to_stream<-   attr$Distance_to_stream
-V(net.g)$Distance_to_tree<-   attr$Distance_to_tree
-V(net.g)$Distance_to_edge<-   attr$Distance_to_edge
-V(net.g)$Neighbour_intra_05m_m2<-   attr$Neighbour_intra_05m_m2
-V(net.g)$Neighbour_inter_05m_m2<-   attr$Neighbour_inter_05m_m2
-V(net.g)$Neighbour_intra_1m_m2<-   attr$Neighbour_intra_1m_m2
-V(net.g)$Neighbour_inter_1m_m2<-   attr$Neighbour_inter_1m_m2
-V(net.g)$Neighbour_intra_2m_m2<-   attr$Neighbour_intra_2m_m2
-V(net.g)$Neighbour_inter_2m_m2<-   attr$Neighbour_inter_2m_m2
-V(net.g)$Neighbour_intra_3m_m2<-   attr$Neighbour_intra_3m_m2 
-V(net.g)$Neighbour_inter_3m_m2<-   attr$Neighbour_inter_3m_m2 
+# Associate plant attributes to plant nodes in the igraph object     
+V(bi.g)$Plant_ID <- c(attr$Plant_ID[1:60], rep(NA, 21))
+V(bi.g)$Max_height_m <- c(attr$Max_height_m[1:60], rep(NA, 21))
+V(bi.g)$Flower_guide <- c(attr$Flower_guide[1:60], rep(NA, 21))
+V(bi.g)$Flower_size <- c(attr$Flower_size[1:60], rep(NA, 21))
+V(bi.g)$Sum_flower_number <- c(attr$Sum_flower_number[1:60], rep(NA, 21)) 
+V(bi.g)$Synchrony_marquis <- c(attr$Synchrony_marquis[1:60], rep(NA, 21))
+V(bi.g)$Distance_to_stream <- c(attr$Distance_to_stream[1:60], rep(NA, 21))
+V(bi.g)$Distance_to_tree <- c(attr$Distance_to_tree[1:60], rep(NA, 21))
+V(bi.g)$Distance_to_edge <- c(attr$Distance_to_edge[1:60], rep(NA, 21))
+V(bi.g)$Neighbour_intra_1m_m2 <- c(attr$Neighbour_intra_1m_m2[1:60], rep(NA, 21))
+V(bi.g)$Neighbour_inter_1m_m2 <- c(attr$Neighbour_inter_1m_m2[1:60], rep(NA, 21))
+V(bi.g)$Neighbour_intra_2m_m2 <- c(attr$Neighbour_intra_2m_m2[1:60], rep(NA, 21))
+V(bi.g)$Neighbour_inter_2m_m2 <- c(attr$Neighbour_inter_2m_m2[1:60], rep(NA, 21))
 
  
 ```
 
 
-# Bipartite network: set matrices and graphs for model testing
+# Bipartite network: set matrices and graphs for model testing (create network object)
 
 After creating the igraph object with associated node information, I have to create an adjacency matrix from the igraph object prior to obtaining the analogous network object. From the igraph object, I also extracted all plant attribute variables to set vertex (i.e. nodes) attributes in the netwwork object. ERGMs work with network objects.
 
  
 ```{r bi.graphs, echo=TRUE, message= TRUE, warning= TRUE, fig.width=9}
 
-AA <- get.adjacency(net.g, attr = "weight")  # create an adjacency matrix from a igraph object
-v.attrs <- get.data.frame(net.g, what="vertices")[1:60,]  # create a dataframe with the attribute variables
+AA <- get.adjacency(bi.g, attr = "weight")  # create an adjacency matrix from a igraph object
+v.attrs <- get.data.frame(bi.g, what="vertices")[1:60,]  # create a dataframe with the attribute variables
  
-# here "bipartite" = number of individual plants in the network, names.eval preserves the weights of the links in the network object
-int.s <- network::as.network(as.matrix(AA),
+
+# Here "bipartite" = number of individual plants in the network, names.eval preserves the weights of the links in the network object as we are working with a weighted network
+
+bi.net <- network::as.network(as.matrix(AA),
                              directed=FALSE, bipartite=60, ignore.eval=FALSE, names.eval='weight') 
 
 
-as.matrix(int.s, attrname="weight") # check the link weights are correct
+as.matrix(bi.net, attrname="weight") # check the link weights are correct
 
-network::set.vertex.attribute(int.s, "Plant_ID",
-                                v.attrs$Plant_ID) 
-network::set.vertex.attribute(int.s, "Max_height_m",
-                                v.attrs$Max_height_m)
-network::set.vertex.attribute(int.s, "Mean_height_m",
-                                v.attrs$Mean_height_m)
-network::set.vertex.attribute(int.s, "Area_m2",
-                                v.attrs$Area_m2)
-network::set.vertex.attribute(int.s, "Perimeter_m",
-                                v.attrs$Perimeter_m)
-network::set.vertex.attribute(int.s, "Flower_guide",
-                                v.attrs$Flower_guide)
-network::set.vertex.attribute(int.s, "Flower_size",
-                                v.attrs$Flower_size)
-network::set.vertex.attribute(int.s, "Mean_flower_number",
-                                v.attrs$Mean_flower_number)
-network::set.vertex.attribute(int.s, "Sum_flower_number",
-                                v.attrs$Sum_flower_number)
-network::set.vertex.attribute(int.s, "Synchrony_marquis",
-                                v.attrs$Synchrony_marquis)
-network::set.vertex.attribute(int.s, "Distance_to_stream",
-                                v.attrs$Distance_to_stream)
-network::set.vertex.attribute(int.s, "Distance_to_tree",
-                                v.attrs$Distance_to_tree)
-network::set.vertex.attribute(int.s, "Distance_to_edge",
-                                v.attrs$Distance_to_edge)
-network::set.vertex.attribute(int.s, "Neighbour_intra_05m_m2",
-                                v.attrs$Neighbour_intra_05m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_inter_05m_m2",
-                                v.attrs$Neighbour_inter_05m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_intra_1m_m2",
-                                v.attrs$Neighbour_intra_1m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_inter_1m_m2",
-                                v.attrs$Neighbour_inter_1m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_intra_2m_m2",
-                                v.attrs$Neighbour_intra_2m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_inter_2m_m2",
-                                v.attrs$Neighbour_inter_2m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_intra_3m_m2",
-                                v.attrs$Neighbour_intra_3m_m2)
-network::set.vertex.attribute(int.s, "Neighbour_inter_3m_m2",
-                                v.attrs$Neighbour_inter_3m_m2)
+# Set plant traits
+
+network::set.vertex.attribute(bi.net, "Plant_ID",
+                                c(v.attrs$Plant_ID, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Max_height_m",
+                                c(v.attrs$Max_height_m, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Flower_guide",
+                                c(v.attrs$Flower_guide, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Flower_size",
+                                c(v.attrs$Flower_size, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Sum_flower_number",
+                                c(v.attrs$Sum_flower_number, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Synchrony_marquis",
+                                c(v.attrs$Synchrony_marquis, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Distance_to_stream",
+                                c(v.attrs$Distance_to_stream, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Distance_to_tree",
+                                c(v.attrs$Distance_to_tree, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Distance_to_edge",
+                                c(v.attrs$Distance_to_edge, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Neighbour_intra_1m_m2",
+                                c(v.attrs$Neighbour_intra_1m_m2, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Neighbour_inter_1m_m2",
+                                c(v.attrs$Neighbour_inter_1m_m2, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Neighbour_intra_2m_m2",
+                                c(v.attrs$Neighbour_intra_2m_m2, rep(NA, 21)))
+network::set.vertex.attribute(bi.net, "Neighbour_inter_2m_m2",
+                                c(v.attrs$Neighbour_inter_2m_m2, rep(NA, 21)))
 
 
-# Set pollinator functional groups as vertex attributes for pollinators (vertex from 61 to 81). The columns of the 'int' dataframe represent the pollinator species in order.
+# Set pollinator functional groups as vertex attributes for pollinators (vertices from 61 to 81). The columns of the 'int.matrix' dataframe represent the pollinator species in order.
 
-pol.sp <- as.data.frame(colnames(int))
+
+## List of pollinator species appearing in the interaction matrix
+pol.sp <- as.data.frame(colnames(int.matrix[, 2:22]))
 colnames(pol.sp)[1] <- "Pollinator_sp"
-pol.sp.fg <- merge(pol.sp, pol.fg, by = "Pollinator_sp", all.y = F, all.x = T)
-pol.sp.fg <- unique(pol.sp.fg)
-as.vector(pol.sp.fg$Pollinator_fg)
 
-network::set.vertex.attribute(int.s, "Pollinator_fg",
+## Merge this list with data on pollinator functional groups, the same list has now a second column specifying the functional group of each species
+pol.fg <- int.data %>% dplyr::select(Pollinator_sp, Pollinator_fg) 
+pol.fg <- unique(pol.fg)
+pol.sp.fg <- join(pol.sp, pol.fg) 
+
+## Associate each pollinator species in the nodes of the network object with its functional group
+network::set.vertex.attribute(bi.net, "Pollinator_fg",
                                 c(rep(NA, 60), as.vector(pol.sp.fg$Pollinator_fg)))
-get.vertex.attribute(int.s, "Pollinator_fg")    
-               
+
+## Check
+bi.net %v% "Pollinator_fg"
+
+
 ```
 
 
-# Bipartite network: models with explanatory variables (valued ERGMs)
+# Bipartite network: predictor variables for valued ERGMs
 
 In its simplest form (binary version), the ERGM specifications involve statistics that are functions only of the network structure (i.e. controlling for endogenous effects derived from just the pattern of links among nodes). The edges term represents connections between a node pair (also links, lines, relationships, ties), it indicates link density and represents exactly the density of the network (in log-odds). That is, the probability of any tie (aka the density of the network) is the inverse-logit of the coefficient on edges.
 
@@ -278,159 +189,314 @@ I set six models including different descriptor variables:
   * Full model including all phenotypic and microsite characteristics of each individual plant
   * Phenotypic traits
   * Microsite characteristics
-  * Neighborhood (intraspecific and interspecific)
+  * Neighborhood
   
 To model the effects of plant attributes I used the b1cov term, defined as the main effect of a covariate for the first mode in a bipartite (aka two-mode) network. To model the effects to the pollinator functional groups, I used the b2factor term (i.e. factor attribute effect for the second mode in a bipartite (aka two-mode) network).
 
 
 ```{r bi.models.fit, echo=TRUE, message= TRUE, warning= TRUE}
 
-ergm.fit00 <- formula(int.s ~ sum) 
+ergm0 <- formula(bi.net ~ sum) 
 
-ergm1 <- formula(int.s ~ sum  
-                        #+ b1cov("Plant_ID", form= "sum")
+ergm1 <- formula(bi.net ~ sum  
                         + b1cov("Max_height_m", form= "sum")
-                        #+ b1cov("Mean_height_m", form= "sum")
-                        #+ b1cov("Area_m2", form= "sum")
-                        #+ b1cov("Perimeter_m", form= "sum")
                         + b1cov("Flower_guide", form= "sum")
-                        + b1cov("Flower_size", form= "sum")
-                        #+ b1cov("Mean_flower_number", form= "sum")
                         + b1cov("Sum_flower_number", form= "sum")
                         + b1cov("Synchrony_marquis", form= "sum")
-                        #+ b1cov("Total_visits", form= "sum")
+                 
                         + b1cov("Distance_to_stream", form= "sum")
                         + b1cov("Distance_to_tree", form= "sum")
                         + b1cov("Distance_to_edge", form= "sum")
-                        #+ b1cov("Neighbour_intra_05m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_05m_m2", form= "sum")
+                 
                         + b1cov("Neighbour_intra_1m_m2", form= "sum")
                         + b1cov("Neighbour_inter_1m_m2", form= "sum")
                         + b1cov("Neighbour_intra_2m_m2", form= "sum")
                         + b1cov("Neighbour_inter_2m_m2", form= "sum")
-                        #+ b1cov("Neighbour_intra_3m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_3m_m2", form= "sum")
+                 
                         + b2factor("Pollinator_fg", form="sum"))
 
-ergm2 <- formula(int.s ~ sum  
-                        #+ b1cov("Plant_ID", form= "sum")
+ergm2 <- formula(bi.net ~ sum  
                         + b1cov("Max_height_m", form= "sum")
-                        #+ b1cov("Mean_height_m", form= "sum")
-                        #+ b1cov("Area_m2", form= "sum")
-                        #+ b1cov("Perimeter_m", form= "sum")
                         + b1cov("Flower_guide", form= "sum")
                         + b1cov("Flower_size", form= "sum")
-                        #+ b1cov("Mean_flower_number", form= "sum")
                         + b1cov("Sum_flower_number", form= "sum")
-                        + b1cov("Synchrony_marquis", form= "sum"))
-                        #+ b1cov("Total_visits", form= "sum")
+                        + b1cov("Synchrony_marquis", form= "sum")
+
                         #+ b1cov("Distance_to_stream", form= "sum")
                         #+ b1cov("Distance_to_tree", form= "sum")
                         #+ b1cov("Distance_to_edge", form= "sum")
-                        #+ b1cov("Neighbour_intra_05m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_05m_m2", form= "sum")
+
                         #+ b1cov("Neighbour_intra_1m_m2", form= "sum")
                         #+ b1cov("Neighbour_inter_1m_m2", form= "sum")
                         #+ b1cov("Neighbour_intra_2m_m2", form= "sum")
                         #+ b1cov("Neighbour_inter_2m_m2", form= "sum")
-                        #+ b1cov("Neighbour_intra_3m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_3m_m2", form= "sum"))
 
-ergm3 <- formula(int.s ~ sum  
-                        #+ b1cov("Plant_ID", form= "sum")
+                        + b2factor("Pollinator_fg", form="sum"))
+
+ergm3 <- formula(bi.net ~ sum  
                         #+ b1cov("Max_height_m", form= "sum")
-                        #+ b1cov("Mean_height_m", form= "sum")
-                        #+ b1cov("Area_m2", form= "sum")
-                        #+ b1cov("Perimeter_m", form= "sum")
                         #+ b1cov("Flower_guide", form= "sum")
                         #+ b1cov("Flower_size", form= "sum")
-                        #+ b1cov("Mean_flower_number", form= "sum")
                         #+ b1cov("Sum_flower_number", form= "sum")
                         #+ b1cov("Synchrony_marquis", form= "sum"))
-                        #+ b1cov("Total_visits", form= "sum")
+                 
                         + b1cov("Distance_to_stream", form= "sum")
                         + b1cov("Distance_to_tree", form= "sum")
-                        + b1cov("Distance_to_edge", form= "sum"))
-                        #+ b1cov("Neighbour_intra_05m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_05m_m2", form= "sum")
+                        + b1cov("Distance_to_edge", form= "sum")
+
                         #+ b1cov("Neighbour_intra_1m_m2", form= "sum")
                         #+ b1cov("Neighbour_inter_1m_m2", form= "sum")
                         #+ b1cov("Neighbour_intra_2m_m2", form= "sum")
                         #+ b1cov("Neighbour_inter_2m_m2", form= "sum")
-                        #+ b1cov("Neighbour_intra_3m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_3m_m2", form= "sum"))
 
-ergm4 <- formula(int.s ~ sum  
-                        #+ b1cov("Plant_ID", form= "sum")
+                        + b2factor("Pollinator_fg", form="sum"))
+
+ergm4 <- formula(bi.net ~ sum  
                         #+ b1cov("Max_height_m", form= "sum")
-                        #+ b1cov("Mean_height_m", form= "sum")
-                        #+ b1cov("Area_m2", form= "sum")
-                        #+ b1cov("Perimeter_m", form= "sum")
                         #+ b1cov("Flower_guide", form= "sum")
                         #+ b1cov("Flower_size", form= "sum")
-                        #+ b1cov("Mean_flower_number", form= "sum")
                         #+ b1cov("Sum_flower_number", form= "sum")
                         #+ b1cov("Synchrony_marquis", form= "sum"))
-                        #+ b1cov("Total_visits", form= "sum")
+                 
                         #+ b1cov("Distance_to_stream", form= "sum")
                         #+ b1cov("Distance_to_tree", form= "sum")
-                        #+ b1cov("Distance_to_edge", form= "sum"))
-                        #+ b1cov("Neighbour_intra_05m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_05m_m2", form= "sum")
+                        #+ b1cov("Distance_to_edge", form= "sum")
+
                         + b1cov("Neighbour_intra_1m_m2", form= "sum")
                         + b1cov("Neighbour_inter_1m_m2", form= "sum")
                         + b1cov("Neighbour_intra_2m_m2", form= "sum")
-                        + b1cov("Neighbour_inter_2m_m2", form= "sum"))
-                        #+ b1cov("Neighbour_intra_3m_m2", form= "sum")
-                        #+ b1cov("Neighbour_inter_3m_m2", form= "sum"))
+                        + b1cov("Neighbour_inter_2m_m2", form= "sum")
+
+                        + b2factor("Pollinator_fg", form="sum"))
 
 
                       
 ```
 
-# Bipartite network : compute models
+# Bipartite network : compute ERGMs
 
 The function used to compute valued ERGMs is the same as that used for binary ERGMs, it only changes
 the way the formula is specified, as well as the addition of the response variable (here "weights") and the reference argument. The response variable here is the link weights, which are attributes of the edges/links in the network object. In defining a valued ERGM it is necessary to specify the reference measure (or distribution) with respect to which the model is defined (in the binary case we employ the Bernoulli distribution of interactions).
 
 For more information see http://statnet.org/Workshops/valued.html#3_valued_ergms :
-"With binary ERGMs, we only concern ourselves with presence and absence of ties among actors — who is connected with whom? If we want to model values as well, we need to think about who is connected with whom and how strong or intense these connections are. In particular, we need to think about how the values for connections we measure are distributed. The reference distribution (a reference measure, for the mathematically inclined) specifies the model for the data before we add any ERGM terms, and is the first step in modeling these values. The reference distribution is specified using a one-sided formula as a reference argument to an ergm or simulate call.
+With binary ERGMs, we only concern ourselves with presence and absence of ties among actors — who is connected with whom? If we want to model values as well, we need to think about who is connected with whom and how strong or intense these connections are. In particular, we need to think about how the values for connections we measure are distributed. The reference distribution (a reference measure, for the mathematically inclined) specifies the model for the data before we add any ERGM terms, and is the first step in modeling these values. The reference distribution is specified using a one-sided formula as a reference argument to an ergm or simulate call.
 
-In the case we don't have an a priori upper bound on the counts — 𝕊={0,1,…} , there are two reference distributions currently available in the ergm.count package: geometric and poisson."
+In the case we don't have an a priori upper bound on the counts — 𝕊={0,1,…} , there are two reference distributions currently available in the ergm.count package: geometric and poisson.
 
 Using reference=~Geometric can be dangerous in the case ERGMs have an infinite sample space. In this case, our count model is a Poisson-reference ERGM in which the expected number of plant-pollinator interactions in the network is modeled as a random variable with a Poisson distribution. Because our plant-pollinator network consists of valued edges that represent counts of interactions, it is well suited to applying the count ERGM with a Poisson distribution.
 
 In the count model, coefficients represent the log of the expected *multiple* by which the edge count values are expected to change given a one-unit change in a covariate. For instance, an specific attribute of an individual plant increases the expected count of interactions with pollinators by a factor of about exp(coeff)=XX.
 
-Running a valued ERGM takes longer than binary ERGMs.
+Running a valued ERGM usually takes longer than binary ERGMs.
 
 ```{r bi.model.tests, echo=TRUE, message= FALSE, warning= TRUE}
 
 # Model tests
 set.seed(42)
-ergm.fit00 <- ergm(ergm00, response = "weight", reference= ~Poisson)  # Simplest model
-ergm.fit1 <- ergm(ergm1, response = "weight", reference= ~Poisson)    # Full model
+ergm.fit0 <- ergm(ergm0, response= "weight", reference= ~Poisson)  # Simplest model
+ergm.fit1 <- ergm(ergm1, response= "weight", reference= ~Poisson)    # Full model
 ergm.fit2 <- ergm(ergm2, response = "weight", reference= ~Poisson)    # with phenotypic variables 
 ergm.fit3 <- ergm(ergm3, response = "weight", reference= ~Poisson)    # with microhabitat variables 
 ergm.fit4 <- ergm(ergm4, response = "weight", reference= ~Poisson)    # with neighbourhood variables
 
-# in order to know the effect of the covariates used at each model, I performed anova for each model
-anova(ergm.fit00, test="Chi") #page 92 book
-anova(ergm.fit1, test="Chi")
-anova(ergm.fit2, test="Chi")
-anova(ergm.fit3, test="Chi")
-anova(ergm.fit4, test="Chi")
 
-anova(ergm.fit00, ergm.fit1, test="Chi")
+summary(ergm.fit0)
+mcmc.diagnostics(ergm.fit0)
 
-summary(ergm.fit00)
 summary(ergm.fit1) 
+mcmc.diagnostics(ergm.fit1) # For ergm() specifically, recent changes in the estimation algorithm mean that these plots can no longer be used to ensure that the mean statistics from the model match the observed network statistics.
+
 summary(ergm.fit2)
+mcmc.diagnostics(ergm.fit2)
+
 summary(ergm.fit3)
+mcmc.diagnostics(ergm.fit3)
+
 summary(ergm.fit4)
+mcmc.diagnostics(ergm.fit4)
+
 
 
 ```
 
-Interpretation of the valued ERGM output: e.g. for flower guide --> the intercept (here "sum") represents the basic propensity of the individual plants in the network to increase the number of times they interact with pollinator species. We can say that the expected number of interactions between an individual plant and a pollinator species is exp(β1)=XX times higher when the plant has larger flower guides. In other words, having larger flower guides increase exp(β1)=XX times the probability to interact more with pollinator species.
+
+Interpretation of the valued ERGM output: e.g. for flower guide --> We can say that the expected number of interactions between an individual plant and a pollinator is exp(β1)=XX times higher when the plant has larger flower guides. In other words, having larger flower guides increase exp(β1)=XX times the probability to interact more with pollinators
+
+
+
+
+# Unipartite network: generate the unipartite projection of the plant-pollinator interaction matrix
+
+The unipartite projection of matrix A for the P plants contains the parallel minimum of the observed interactions between two individual plants, so that the level of pollinator sharing is driven by the lowest communality in interactions with pollinator species. In this unipartite network, two individual plants are linked if they share at least one interaction with the same pollinator species. 
+
+```{r uni.graph, echo=TRUE, message= FALSE, warning= TRUE}
+
+uni <- as.one.mode(as.matrix(pol.int), project="lower") # pol.int is the plant-pollinator interaction matrix, plants in rows and pollinators in columns
+
+
+```
+
+
+# Unipartite network: set node attributes in igraph object
+
+```{r uni.nodes, echo=TRUE, message= FALSE, warning= TRUE}
+
+uni.g <- graph.adjacency(uni, mode = "undirected", weighted = TRUE, diag = FALSE) # igraph object
+
+V(uni.g)$Plant_ID<-     attr$Plant_ID
+V(uni.g)$Max_height_m<-     attr$Max_height_m
+V(uni.g)$Flower_guide<-   attr$Flower_guide
+V(uni.g)$Flower_size<-   attr$Flower_size 
+V(uni.g)$Sum_flower_number<-   attr$Sum_flower_number 
+V(uni.g)$Synchrony_marquis<-   attr$Synchrony_marquis
+V(uni.g)$Distance_to_stream<-   attr$Distance_to_stream
+V(uni.g)$Distance_to_tree<-   attr$Distance_to_tree
+V(uni.g)$Distance_to_edge<-   attr$Distance_to_edge
+V(uni.g)$Neighbour_intra_1m_m2<-   attr$Neighbour_intra_1m_m2
+V(uni.g)$Neighbour_inter_1m_m2<-   attr$Neighbour_inter_1m_m2
+V(uni.g)$Neighbour_intra_2m_m2<-   attr$Neighbour_intra_2m_m2
+V(uni.g)$Neighbour_inter_2m_m2<-   attr$Neighbour_inter_2m_m2
+
+
+```
+
+
+# Unipartite network: set matrices and graphs for model testing (create network object) 
+
+```{r uni.graphs, echo=TRUE, message= FALSE, warning= TRUE}
+
+
+uni.AA <- get.adjacency(uni.g, attr = "weight") # First separate the igraph object into adjacency matrix and plant attributes
+
+uni.v.attrs <- get.data.frame(uni.g, what="vertices")[1:60,]
+
+
+uni.net <- network::as.network(as.matrix(uni.AA),
+                             directed=FALSE, ignore.eval=FALSE, names.eval='weight')   # network object for ergm 
+
+
+as.matrix(uni.net,attrname="weight") # We can view the weight attribute as a matrix
+#get.edge.attribute(uni.s, "weight")
+
+
+network::set.vertex.attribute(uni.net, "Plant_ID",
+                                uni.v.attrs$Plant_ID) 
+network::set.vertex.attribute(uni.net, "Max_height_m",
+                                uni.v.attrs$Max_height_m)
+network::set.vertex.attribute(uni.net, "Flower_guide",
+                                uni.v.attrs$Flower_guide)
+network::set.vertex.attribute(uni.net, "Flower_size",
+                                uni.v.attrs$Flower_size)
+network::set.vertex.attribute(uni.net, "Sum_flower_number",
+                                uni.v.attrs$Sum_flower_number)
+network::set.vertex.attribute(uni.net, "Synchrony_marquis",
+                                uni.v.attrs$Synchrony_marquis)
+network::set.vertex.attribute(uni.net, "Distance_to_stream",
+                                uni.v.attrs$Distance_to_stream)
+network::set.vertex.attribute(uni.net, "Distance_to_tree",
+                                uni.v.attrs$Distance_to_tree)
+network::set.vertex.attribute(uni.net, "Distance_to_edge",
+                                uni.v.attrs$Distance_to_edge)
+network::set.vertex.attribute(uni.net, "Neighbour_intra_1m_m2",
+                                uni.v.attrs$Neighbour_intra_1m_m2)
+network::set.vertex.attribute(uni.net, "Neighbour_inter_1m_m2",
+                                uni.v.attrs$Neighbour_inter_1m_m2)
+network::set.vertex.attribute(uni.net, "Neighbour_intra_2m_m2",
+                                uni.v.attrs$Neighbour_intra_2m_m2)
+network::set.vertex.attribute(uni.net, "Neighbour_inter_2m_m2",
+                                uni.v.attrs$Neighbour_inter_2m_m2)
+
+
+# To include the effects of the spatial distance between individual plants on pollinator sharing
+
+uni.distance <- read.csv("Data/distance_matrix.csv", sep=",") 
+
+uni.distance <- as.matrix(uni.distance[,2:61])
+
+set.network.attribute(uni.net, "distance", uni.distance) # spatial distance between plants as network attribute
+get.network.attribute(uni.net, "distance")
+
+```
+
+
+# Unipartite network: predictor variables for valued ERGMs
+
+We modelled the structure of the unipartite plant–plant network as a function of the sum of the link weights as a structural covariate, and the dissimilarity in intrinsic and extrinsic plant attributes between individuals as node-based covariates. For each plant attribute, the dissimilarity is explicitly measured by the model as the absolute difference in two plants' values for that attribute. By doing so, we aimed to investigate whether individual plants with similar plant attributes shared more pollinator species, potentially leading to assortative mating events.
+
+```{r uni.models, echo=TRUE, message= FALSE, warning= TRUE}
+
+
+uni.ergm0 <- formula(uni.net ~ sum) 
+
+
+# test main effects of plant traits in sharing pollinators
+uni.ergm1 <- formula(uni.net ~ sum  
+                        + nodecov("Max_height_m", form= "sum")
+                        + nodecov("Flower_guide", form= "sum")
+                        + nodecov("Flower_size", form= "sum")
+                        + nodecov("Sum_flower_number", form= "sum")
+                        + nodecov("Synchrony_marquis", form= "sum")
+
+                        + nodecov("Distance_to_stream", form= "sum")
+                        + nodecov("Distance_to_tree", form= "sum")
+                        + nodecov("Distance_to_edge", form= "sum")
+
+                        + nodecov("Neighbour_intra_1m_m2", form= "sum")
+                        + nodecov("Neighbour_inter_1m_m2", form= "sum")
+                        + nodecov("Neighbour_intra_2m_m2", form= "sum")
+                        + nodecov("Neighbour_inter_2m_m2", form= "sum")
+                     
+                        + edgecov("distance", form="sum"))
+
+# test homophily 
+uni.ergm2 <- formula(uni.net ~ sum  
+                        + absdiff("Max_height_m", form= "sum")
+                        + absdiff("Flower_guide", form= "sum")
+                        + absdiff("Flower_size", form= "sum")
+                        + absdiff("Sum_flower_number", form= "sum")
+                        + absdiff("Synchrony_marquis", form= "sum")
+
+                        + absdiff("Distance_to_stream", form= "sum")
+                        + absdiff("Distance_to_tree", form= "sum")
+                        + absdiff("Distance_to_edge", form= "sum")
+
+                        + absdiff("Neighbour_intra_1m_m2", form= "sum")
+                        + absdiff("Neighbour_inter_1m_m2", form= "sum")
+                        + absdiff("Neighbour_intra_2m_m2", form= "sum")
+                        + absdiff("Neighbour_inter_2m_m2", form= "sum")
+
+                        + edgecov("distance", form="sum"))
+
+
+```
+
+
+# Unipartite network: compute ERGMs
+
+```{r uni.model.tests, echo=TRUE, message= FALSE, warning= TRUE}
+
+set.seed(42)
+uni.ergm.fit0 <- ergm(uni.ergm0, response ="weight", reference= ~Poisson) 
+uni.ergm.fit1 <- ergm(uni.ergm1, response ="weight", reference= ~Poisson)   
+uni.ergm.fit2 <- ergm(uni.ergm2, response ="weight", reference= ~Poisson) 
+
+
+summary(uni.ergm.fit0) 
+mcmc.diagnostics(uni.ergm.fit0)
+
+summary(uni.ergm.fit1) 
+mcmc.diagnostics(uni.ergm.fit1)
+
+summary(uni.ergm.fit2)
+mcmc.diagnostics(uni.ergm.fit2)
+
+
+```
+
+Interpretation of the absdiff estimates:
+
+- A positive estimate for a given plant trait indicates that the probability of pollinator sharing between any pair of individual plants increases with the dissimilarity between plants in that trait (= heterophilly). In this case, individual plants with similar values of a given trait tend to share less pollinators.
+
+If the estimate for a given trait is negative, the probability of pollinator sharing between any pair of individual plants increases with the similarity between plants in that trait (= homophily). Individual plants with similar values of a given trait tend to share more pollinators. 
+
 
