@@ -31,6 +31,7 @@ library(Hmisc)
 library(network)
 library(nlme)
 library(ergm.count)
+library(MuMIn) #for AIC table representation
 
 ```
  
@@ -42,12 +43,14 @@ library(ergm.count)
 # read interaction data
 int.data <- read.table("Data/rocina_halimium_09072019.csv", sep=";", header=T)
 str(int.data)
+int.data <- int.data %>% dplyr::rename( ID = ï..ID)
 int.data$N_visits <- as.numeric(int.data$N_visits)
 
 
 # create interaction matrix (individual plants x pollinator species)
 int.matrix <- dcast(int.data %>%dplyr::select(Plant_ID, Pollinator_sp, N_visits), 
                     Plant_ID ~ Pollinator_sp, value.var="N_visits", fun.aggregate = sum)
+#pivot_wider
 
 # read plant attributes and merge with the interaction matrix
 trait.data <- read.table("Data/individual_data_halimium_20190714.csv", sep=";", header=T)
@@ -63,15 +66,17 @@ The 'complete.df' dataframe comprises both interaction data and plant attributes
 ```{r bi.nodes, echo= TRUE, message= TRUE, warning= FALSE, fig.width= 9}
  
 # Subset interaction data
-pol.int <- complete.df %>% 
+pol.int <- complete.df %>%    #data frame solo con las interacciones
            dplyr::select(2:22) 
            
-bi.g <- graph_from_incidence_matrix(pol.int, weighted= T, add.names=NULL) # create the igraph object
+bi.g <- igraph::graph_from_incidence_matrix(pol.int, weighted= T, add.names=NULL) # create the igraph object
+                #we use incidence because it is a bipartite
+                # add.names = NULL (cuando el nombre de las columnas tiene las especies)
 
  
 # Subset the covariates from the main dataset (phenotypic and microsite variation among plant individuals)
 attr <- complete.df %>%  
-           dplyr::select(c(1, 25:51)) 
+           dplyr::select(c(1, 25:51)) #separa los atributos de las plantas
 
 # Scale the predictor variables I will use in the models
 attr$Max_height_m <- scale(attr$Max_height_m)
@@ -87,8 +92,12 @@ attr$Neighbour_inter_1m_m2 <- scale(attr$Neighbour_inter_1m_m2)
 attr$Neighbour_intra_2m_m2 <- scale(attr$Neighbour_intra_2m_m2)
 attr$Neighbour_inter_2m_m2 <- scale(attr$Neighbour_inter_2m_m2)
                  
-# Associate plant attributes to plant nodes in the igraph object     
-V(bi.g)$Plant_ID <- c(attr$Plant_ID[1:60], rep(NA, 21))
+# Associate plant attributes to plant nodes in the igraph object 
+#V = vertices
+
+V(bi.g)$Plant_ID <- c(attr$Plant_ID[1:60], rep(NA, 21)) #solo IDs para los nodos de plantas (crea atributos de las plantas)
+#para esto, necesitas saber de antemanos el tamaño de la red, cambiar por función para calcular el tamaño de la matriz de adyacencia
+
 V(bi.g)$Max_height_m <- c(attr$Max_height_m[1:60], rep(NA, 21))
 V(bi.g)$Flower_guide <- c(attr$Flower_guide[1:60], rep(NA, 21))
 V(bi.g)$Flower_size <- c(attr$Flower_size[1:60], rep(NA, 21))
@@ -102,6 +111,7 @@ V(bi.g)$Neighbour_inter_1m_m2 <- c(attr$Neighbour_inter_1m_m2[1:60], rep(NA, 21)
 V(bi.g)$Neighbour_intra_2m_m2 <- c(attr$Neighbour_intra_2m_m2[1:60], rep(NA, 21))
 V(bi.g)$Neighbour_inter_2m_m2 <- c(attr$Neighbour_inter_2m_m2[1:60], rep(NA, 21))
 
+#l = labels
  
 ```
 
@@ -110,10 +120,12 @@ V(bi.g)$Neighbour_inter_2m_m2 <- c(attr$Neighbour_inter_2m_m2[1:60], rep(NA, 21)
 
 After creating the igraph object with associated node information, I have to create an adjacency matrix from the igraph object prior to obtaining the analogous network object. From the igraph object, I also extracted all plant attribute variables to set vertex (i.e. nodes) attributes in the netwwork object. ERGMs work with network objects.
 
+De objeto igraph, hay que pasar la red a objeto "network"
  
 ```{r bi.graphs, echo=TRUE, message= TRUE, warning= TRUE, fig.width=9}
 
-AA <- get.adjacency(bi.g, attr = "weight")  # create an adjacency matrix from a igraph object
+AA <- get.adjacency(bi.g, attr = "weight")  # create an adjacency matrix from a igraph object using the weight attributes of the igraph object
+
 v.attrs <- get.data.frame(bi.g, what="vertices")[1:60,]  # create a dataframe with the attribute variables
  
 
@@ -122,6 +134,7 @@ v.attrs <- get.data.frame(bi.g, what="vertices")[1:60,]  # create a dataframe wi
 bi.net <- network::as.network(as.matrix(AA),
                              directed=FALSE, bipartite=60, ignore.eval=FALSE, names.eval='weight') 
 
+#con el argumento "bipartite", le decimos que los primeros 60 objetos son plantas. 
 
 as.matrix(bi.net, attrname="weight") # check the link weights are correct
 
@@ -198,6 +211,7 @@ To model the effects of plant attributes I used the b1cov term, defined as the m
 
 ergm0 <- formula(bi.net ~ sum) 
 
+#saturado
 ergm1 <- formula(bi.net ~ sum  
                         + b1cov("Max_height_m", form= "sum")
                         + b1cov("Flower_guide", form= "sum")
@@ -214,7 +228,9 @@ ergm1 <- formula(bi.net ~ sum
                         + b1cov("Neighbour_inter_2m_m2", form= "sum")
                  
                         + b2factor("Pollinator_fg", form="sum"))
+#b2factor (porque es una variable categórica del segundo factor)
 
+#solo variables fenótipicas
 ergm2 <- formula(bi.net ~ sum  
                         + b1cov("Max_height_m", form= "sum")
                         + b1cov("Flower_guide", form= "sum")
@@ -232,7 +248,7 @@ ergm2 <- formula(bi.net ~ sum
                         #+ b1cov("Neighbour_inter_2m_m2", form= "sum")
 
                         + b2factor("Pollinator_fg", form="sum"))
-
+#microhábitat
 ergm3 <- formula(bi.net ~ sum  
                         #+ b1cov("Max_height_m", form= "sum")
                         #+ b1cov("Flower_guide", form= "sum")
@@ -250,7 +266,7 @@ ergm3 <- formula(bi.net ~ sum
                         #+ b1cov("Neighbour_inter_2m_m2", form= "sum")
 
                         + b2factor("Pollinator_fg", form="sum"))
-
+#vecindario
 ergm4 <- formula(bi.net ~ sum  
                         #+ b1cov("Max_height_m", form= "sum")
                         #+ b1cov("Flower_guide", form= "sum")
@@ -305,6 +321,8 @@ mcmc.diagnostics(ergm.fit0)
 
 summary(ergm.fit1) 
 mcmc.diagnostics(ergm.fit1) # For ergm() specifically, recent changes in the estimation algorithm mean that these plots can no longer be used to ensure that the mean statistics from the model match the observed network statistics.
+
+#exp(estimate) #para saber la probabilidad de enlace
 
 summary(ergm.fit2)
 mcmc.diagnostics(ergm.fit2)
@@ -431,7 +449,7 @@ uni.ergm0 <- formula(uni.net ~ sum)
 
 # test main effects of plant traits in sharing pollinators
 uni.ergm1 <- formula(uni.net ~ sum  
-                        + nodecov("Max_height_m", form= "sum")
+                        + nodecov("Max_height_m", form= "sum") #atributo cuantitativo en red unipartita
                         + nodecov("Flower_guide", form= "sum")
                         + nodecov("Flower_size", form= "sum")
                         + nodecov("Sum_flower_number", form= "sum")
@@ -451,6 +469,7 @@ uni.ergm1 <- formula(uni.net ~ sum
 # test homophily 
 uni.ergm2 <- formula(uni.net ~ sum  
                         + absdiff("Max_height_m", form= "sum")
+                     #diferencia en la altura de las plantas (atributo del enlace)
                         + absdiff("Flower_guide", form= "sum")
                         + absdiff("Flower_size", form= "sum")
                         + absdiff("Sum_flower_number", form= "sum")
@@ -467,7 +486,7 @@ uni.ergm2 <- formula(uni.net ~ sum
 
                         + edgecov("distance", form="sum"))
 
-
+#se incluye una matriz de distancia escalada como atributo del objeto network
 ```
 
 
